@@ -13,19 +13,19 @@ OUTPUT_FILE = "rainfallDataSmartFeatures.parquet"
 def calculate_slope_vectorized(y_data):
     """
     Calculates the linear trend slope for a time series.
-    Designed to be used with xarray.apply_ufunc.
+    Returns 0.0 if data is flat or invalid.
     """
     # Create x-axis (years 0 to N)
     x = np.arange(y_data.shape[-1])
 
-    # If a pixel is all NaNs (ocean) or all zeros, return NaN
+    # Safety Check: If a pixel is all NaNs (ocean) or all zeros
     if np.isnan(y_data).all() or np.all(y_data == 0):
         return np.nan
 
-    # Calculate slope (vectorized linear regression is complex, so we loop
-    # over the core dimension or use polyfit for speed on small arrays)
+    # If variance is 0 (e.g., all values are the same), slope is 0
     if np.std(y_data) == 0:
         return 0.0
+
     slope, _, _, _, _ = linregress(x, y_data)
     return slope
 
@@ -45,10 +45,8 @@ def calculate_max_dry_spell(ds_year):
 def get_trend_grid(data_array):
     """
     Wrapper to apply slope calculation safely across Dask chunks.
-    FIX: Forces 'year' dimension to be a single chunk to prevent ValueErrors.
+    CRITICAL FIX: Forces 'year' dimension to be a single chunk.
     """
-    # Force the core dimension 'year' to be contiguous (1 chunk)
-    # We keep lat/lon chunked to save memory
     data_array = data_array.chunk({"year": -1})
 
     return xr.apply_ufunc(
@@ -65,9 +63,8 @@ def get_trend_grid(data_array):
 
 
 def preprocess_rainfall():
-    print("🚀 Starting Advanced Feature Extraction (1991-2025)...")
+    print("🚀 Starting Final Smart Feature Extraction (1991-2025)...")
 
-    # 1. Load Data
     file_list = sorted(
         [DATA_DIR / f"RF25_ind{year}_rfp25.nc" for year in range(1991, 2026)]
     )
@@ -77,7 +74,7 @@ def preprocess_rainfall():
         print("❌ No files found! Check path.")
         return
 
-    # Chunk by time to fit in memory
+    # Load Data (Chunked spatially to save RAM)
     ds = xr.open_mfdataset(
         valid_files,
         combine="by_coords",
@@ -85,82 +82,94 @@ def preprocess_rainfall():
     )
     rainfall = ds.RAINFALL
 
-    print("🧠 Computing Time-Series Metrics (Yearly Aggregates)...")
+    print("🧠 Computing Time-Series Metrics...")
 
-    # A. Yearly Totals & Averages
+    # 1. Yearly Aggregates
     yearly_sum = rainfall.groupby("TIME.year").sum()
+
+    # P95 (For Filter Efficiency Design)
     yearly_p95 = rainfall.groupby("TIME.year").quantile(0.95, dim="TIME")
 
-    # B. Yearly Rainy Days Count (> 2.5mm)
+    # Peak Daily (For Overflow Safety Design) - NEW CRITICAL FEATURE
+    yearly_peak = rainfall.groupby("TIME.year").max(dim="TIME")
+
+    # Rainy Days (> 2.5mm)
     is_rainy_day = rainfall > 2.5
     yearly_rainy_days = is_rainy_day.groupby("TIME.year").sum()
 
-    # C. Yearly Simple Daily Intensity Index (SDII)
-    # Avoid division by zero
-    yearly_sdii = yearly_sum / yearly_rainy_days.where(yearly_rainy_days > 0)
+    # Simple Daily Intensity Index (SDII)
+    # FIX: We fillna(0) to prevent NaN trends in dry years
+    yearly_sdii = (yearly_sum / yearly_rainy_days.where(yearly_rainy_days > 0)).fillna(
+        0
+    )
 
-    # D. Yearly Max Dry Spells (Complex Sequence)
-    # We map the dry spell function over each year
-    print("⏳ calculating dry spell sequences (this is heavy)...")
+    # Max Dry Spells
+    print("⏳ Calculating dry spell sequences...")
     yearly_max_dry = rainfall.groupby("TIME.year").map(calculate_max_dry_spell)
 
-    # --- Trend Analysis (The "ML" Part) ---
-    print("📈 Extracting Trends and Slopes (1991-2025)...")
-
-    # We use the corrected helper function here
+    # 2. Trend Analysis
+    print("📈 Extracting Trends (Slopes)...")
     slope_dry_days = get_trend_grid(yearly_max_dry)
     slope_rainy_days = get_trend_grid(yearly_rainy_days)
     slope_sdii = get_trend_grid(yearly_sdii)
     slope_p95 = get_trend_grid(yearly_p95)
+    slope_peak = get_trend_grid(yearly_peak)  # Trend of extreme storms
 
-    # --- Baseline Averages ---
+    # 3. Computing Baselines (Averages)
     print("📊 Computing Final Baselines...")
-
-    # 35-Year Averages
     avg_annual_rain = yearly_sum.mean(dim="year")
     avg_max_dry = yearly_max_dry.mean(dim="year")
     avg_p95_daily = yearly_p95.mean(dim="year")
+    avg_peak_daily = yearly_peak.mean(dim="year")  # Average "Worst Day of the Year"
 
-    # Recent 10-Year Averages (for "Climate Shift" detection)
+    # Recent 10-Year Averages
     recent_years = yearly_sum.sel(year=slice(2016, 2025))
     avg_recent_rain = recent_years.mean(dim="year")
 
-    # Reliability (Coefficient of Variation)
+    # Reliability (CV)
     cv_reliability = yearly_sum.std(dim="year") / avg_annual_rain
 
-    # --- Formatting for Output ---
-    print("🧹 Flattening to Table...")
+    # 4. Flattening to Table
+    print("🧹 Creating Final Table...")
 
-    # Base DataFrame
+    # We create the DataFrame and explicitly compute() Dask arrays to prevent lazy loading errors
     df = avg_annual_rain.to_dataframe(name="annual_avg_mm").reset_index()
 
-    # Add Feature Columns (using .values.flatten() to safeguard index alignment)
-    # Note: We compute the Dask arrays to numpy before flattening to ensure speed
-    print("   -> Fetching computed values...")
-    df["recent_10yr_avg_mm"] = avg_recent_rain.compute().values.flatten()
-    df["cv_reliability"] = cv_reliability.compute().values.flatten()
-    df["avg_max_dry_days"] = avg_max_dry.compute().values.flatten()
-    df["p95_daily_mm"] = avg_p95_daily.compute().values.flatten()
+    # Helper to add columns safely
+    def add_col(name, dask_array):
+        df[name] = dask_array.compute().values.flatten()
 
-    # Trend Features (These were the ones causing issues)
-    print("   -> Computing Slopes...")
-    df["trend_dry_days_per_year"] = slope_dry_days.compute().values.flatten()
-    df["trend_rainy_days_per_year"] = slope_rainy_days.compute().values.flatten()
-    df["trend_sdii_intensity"] = slope_sdii.compute().values.flatten()
-    df["trend_p95_intensity"] = slope_p95.compute().values.flatten()
+    add_col("recent_10yr_avg_mm", avg_recent_rain)
+    add_col("cv_reliability", cv_reliability)
+    add_col("avg_max_dry_days", avg_max_dry)
+    add_col("p95_daily_mm", avg_p95_daily)
+    add_col("peak_daily_mm", avg_peak_daily)  # The critical metric for overflow
 
-    # --- Derived Engineering Features ---
-    # 15-min Peak Intensity using 1/3 Power Law: P_15min = P_24hr * (0.25/24)^(1/3)
-    power_law_factor = (0.25 / 24) ** (1 / 3)  # ~0.218
-    df["design_15min_intensity_mm"] = df["p95_daily_mm"] * power_law_factor
+    # Trends
+    add_col("trend_dry_days_per_year", slope_dry_days)
+    add_col("trend_rainy_days_per_year", slope_rainy_days)
+    add_col("trend_sdii_intensity", slope_sdii)
+    add_col("trend_p95_intensity", slope_p95)
+    add_col("trend_peak_intensity", slope_peak)  # Is the "worst day" getting worse?
 
-    # Cleanup: Remove ocean pixels (NaNs) to save space
+    # 5. Derived Engineering Features (Power Law Approximation)
+    # Factor = (0.25 hours / 24 hours) ^ (1/3) ≈ 0.218
+    power_law_factor = 0.218
+
+    # For Filter Sizing (Efficiency): Uses P95 (Standard heavy rain)
+    df["design_15min_filter_intensity_mm"] = df["p95_daily_mm"] * power_law_factor
+
+    # For Overflow Sizing (Safety): Uses Peak Daily (Extreme rain)
+    # This roughly matches the CPWD "Peak Intensity" requirements
+    df["design_15min_overflow_intensity_mm"] = df["peak_daily_mm"] * power_law_factor
+
+    # Cleanup
     df = df.dropna(subset=["annual_avg_mm"])
 
     # Save
     df.to_parquet(OUTPUT_FILE, index=False)
-    print(f"✅ SUCCESS: ML Feature Store created at {OUTPUT_FILE}")
-    print(f"📊 Features extracted: {list(df.columns)}")
+    print(f"✅ SUCCESS: Final ML Feature Store created at {OUTPUT_FILE}")
+    print(f"📊 Features extracted: {len(df.columns)} columns")
 
 
 if __name__ == "__main__":
