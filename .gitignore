@@ -1,0 +1,22 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large Datasets & ML Models (Go to GitHub Releases)
+*.parquet
+*.pkl
+*.csv
+
+# OS generated files
+.DS_Store
+Thumbs.db

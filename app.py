@@ -3,9 +3,15 @@ import pandas as pd
 import numpy as np
 import joblib
 import plotly.express as px
+import folium
+from folium.plugins import Draw
+from streamlit_folium import st_folium
+from shapely.geometry import shape
+from pyproj import Geod
+from geopy.geocoders import Nominatim
+from folium.plugins import LocateControl
 
 # --- PAGE CONFIGURATION ---
-# This must be the very first Streamlit command
 st.set_page_config(page_title="Digital Hydro-Consultant", page_icon="💧", layout="wide")
 
 # --- CONSTANTS ---
@@ -94,7 +100,6 @@ def main():
             clicked_lat = map_data["selection"]["points"][0]["lat"]
             clicked_lon = map_data["selection"]["points"][0]["lon"]
 
-            # If the user clicked a new dot, update the sidebar and force a new report
             if (
                 st.session_state.lat_input != clicked_lat
                 or st.session_state.lon_input != clicked_lon
@@ -103,10 +108,26 @@ def main():
                 st.session_state.lon_input = clicked_lon
                 st.session_state.report_generated = True
 
-    # 4. Sidebar UI
+    # 4. Sidebar UI (Cleaned up and Deduplicated)
     with st.sidebar:
-        st.header("📍 Location Input")
-        st.markdown("Enter coordinates or click a point on the map below.")
+        st.header("📍 Location Setup")
+
+        # --- FEATURE: Location Search ---
+        search_query = st.text_input(
+            "🔍 Search City or Address", placeholder="e.g., Bandra, Mumbai"
+        )
+        if st.button("Find Location"):
+            try:
+                geolocator = Nominatim(user_agent="digital_hydro_app")
+                loc = geolocator.geocode(search_query)
+                if loc:
+                    st.session_state.lat_input = loc.latitude
+                    st.session_state.lon_input = loc.longitude
+                    st.success(f"Found: {loc.address.split(',')[0]}")
+                else:
+                    st.error("Location not found.")
+            except Exception:
+                st.error("Geocoding service unavailable.")
 
         input_lat = st.number_input(
             "Latitude", format="%.4f", key="lat_input", step=0.01
@@ -116,10 +137,69 @@ def main():
         )
 
         st.markdown("---")
-        st.header("🏠 Property Details")
+        st.header("🏠 Property Setup")
+
+        if "calculated_roof_area" not in st.session_state:
+            st.session_state.calculated_roof_area = 150.0
+
+        # --- FEATURE: Bigger Map via use_column_width ---
+        with st.expander("🛰️ Map Locator & Roof Tracing", expanded=True):
+            st.markdown(
+                "1. Click **[ 🎯 ]** on the map to use your GPS.\n"
+                "2. Click **[ ⬟ ]** to trace your roof and calculate area."
+            )
+
+            m = folium.Map(
+                location=[st.session_state.lat_input, st.session_state.lon_input],
+                zoom_start=18,
+                max_zoom=21,
+            )
+
+            # --- FEATURE: Satellite + Labels ---
+            folium.TileLayer(
+                tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+                attr="Google",
+                name="Google Satellite Hybrid",
+                overlay=False,
+                control=True,
+            ).add_to(m)
+
+            # --- FEATURE: Auto-Locate GPS Button ---
+            LocateControl(auto_start=False, position="topright").add_to(m)
+
+            Draw(
+                export=False,
+                position="topleft",
+                draw_options={
+                    "polyline": False,
+                    "rectangle": True,
+                    "circle": False,
+                    "circlemarker": False,
+                    "marker": False,
+                    "polygon": True,
+                },
+            ).add_to(m)
+
+            # Map render
+            map_data = st_folium(
+                m, key="roof_mapper", height=450, use_column_width=True
+            )
+
+            if map_data and map_data["all_drawings"]:
+                try:
+                    geom = shape(map_data["all_drawings"][0]["geometry"])
+                    geod = Geod(ellps="WGS84")
+                    area, _ = geod.geometry_area_perimeter(geom)
+                    st.session_state.calculated_roof_area = round(abs(area), 1)
+                    st.success(
+                        f"Calculated: {st.session_state.calculated_roof_area} m²"
+                    )
+                except Exception:
+                    st.error("Error calculating area. Please redraw.")
+
         input_roof_area = st.number_input(
-            "Rooftop Area (sq meters)",
-            value=150.0,
+            "Total Catchment Area (sq meters)",
+            value=st.session_state.calculated_roof_area,
             min_value=10.0,
             max_value=10000.0,
             step=10.0,
@@ -231,7 +311,7 @@ def main():
                     delta_color="inverse",
                 )
 
-        # Dynamic Safety Warnings based on AI output and User Simulator Math
+        # Dynamic Safety Warnings
         if overflow > 0:
             if "Zone 3" in predicted_zone:
                 st.error(
@@ -255,30 +335,24 @@ def main():
         # --- Render Plotly Interactive Map ---
         st.subheader("🗺️ Hydrological Zone Mapping")
 
-        # Overlay Toggle
         show_overlay = st.toggle(
             "Show AI Hydrological Grid Overlay",
             value=True,
             help="Turn this off to hide the 5,000 data points and view the clean geographical base map.",
         )
-
         st.markdown(
             f"**Grid Match:** System aligned to Lat {grid['LATITUDE']:.2f}, Lon {grid['LONGITUDE']:.2f}"
         )
 
-        # Data Routing based on toggle
         plot_df = df_master if show_overlay else df_master.iloc[0:0]
 
-        # Build Map
         fig = px.scatter_mapbox(
             plot_df,
             lat="LATITUDE",
             lon="LONGITUDE",
             color="EXPERT_ZONE",
             color_discrete_map=ZONE_COLORS,
-            category_orders={
-                "EXPERT_ZONE": list(ZONE_COLORS.keys())
-            },  # 👈 THE FIX: Forces strict 1-5 sorting
+            category_orders={"EXPERT_ZONE": list(ZONE_COLORS.keys())},
             hover_name="EXPERT_ZONE",
             hover_data={
                 "LATITUDE": False,
@@ -292,7 +366,6 @@ def main():
             mapbox_style="carto-darkmatter",
         )
 
-        # Add Marker for current location
         fig.add_scattermapbox(
             lat=[grid["LATITUDE"]],
             lon=[grid["LONGITUDE"]],
@@ -306,7 +379,6 @@ def main():
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
         )
 
-        # Render Map with click-detection and zoom unlocked
         st.plotly_chart(
             fig,
             use_container_width=True,
